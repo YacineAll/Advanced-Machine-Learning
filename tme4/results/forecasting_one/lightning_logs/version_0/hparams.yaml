@@ -1,0 +1,25 @@
+batch_size: 32
+columns:
+- 0
+- 1
+- 2
+- 3
+- 4
+- 5
+- 6
+- 7
+- 8
+- 9
+data_dir: ./data
+default_root_dir: ./results/forecasting_one
+forcasting: true
+input_size: 1
+latent_size: 20
+learning_rate: 0.001
+multi: false
+normalize: true
+output: 10
+pas_de_temp: 2
+progress_bar_refresh_rate: 25
+seq_length: 15
+task: 2

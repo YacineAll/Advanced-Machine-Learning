@@ -1,44 +1,149 @@
+from abc import abstractmethod, ABC
+
+import pandas as pd
+import numpy as np
+
 
 import torch
 import torch.nn as nn
-import numpy as np
-import pandas as pd
-import logging
-import csv
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+import torch.nn.functional as F
+import torch.optim as optim
 
-from pathlib import Path
+import pytorch_lightning as pl
+from pytorch_lightning.metrics import Accuracy
+from pytorch_lightning.metrics.regression import MeanSquaredError
 
-from abc import ABC, abstractmethod
+from torch.utils.data import DataLoader
+from sklearn.preprocessing import StandardScaler
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-logging.basicConfig(level=logging.INFO)
+from typing import Union, Tuple
 
 
-def fill_na(mat):
-    ix, iy = np.where(np.isnan(mat))
-    for i, j in zip(ix, iy):
-        if np.isnan(mat[i+1, j]):
-            mat[i, j] = mat[i-1, j]
+class SequenceDataset(torch.utils.data.Dataset):
+    """Some Information about SequenceDataset"""
+
+    def __init__(self, x: np.ndarray, y: np.ndarray, forcasting:bool=False):
+        super(SequenceDataset, self).__init__()
+        self.x = x
+        self.y = y
+        self.forcasting=forcasting
+
+    def __getitem__(self, index):
+        x, y = self.x[index], self.y[index]
+        if self.forcasting:
+            return x.astype(np.float32), y.astype(np.float32)
+        return x.astype(np.float32), y.astype(np.int64)
+
+    def __len__(self):
+        return len(self.x)
+
+
+class Temperature(pl.LightningDataModule):
+    """Some Information about MyModule"""
+    def __init__(self,
+                seq_length: Union[int, Tuple[int, int]] = 10,
+                batch_size: int = 32,
+                data_dir: str = '.',
+                columns: Union[list, str] = "all",
+                task: int = 0,
+                normalize:bool=False,
+                multi:bool=False,
+                **kwargs,
+    ):
+
+        super(Temperature, self).__init__()
+        temperatures_train = pd.read_csv(
+            f'{data_dir}/tempAMAL_train.csv', low_memory=False)
+        temperatures_test = pd.read_csv(
+            f'{data_dir}/tempAMAL_test.csv', low_memory=False, header=None)
+        train = temperatures_train.iloc[:11115, :].dropna()
+        train = pd.concat(
+            [train, temperatures_train.iloc[11116:-1, :].dropna()], axis=0)
+        train = train.set_index('datetime')
+        test = temperatures_test.iloc[1:, :].dropna()
+        test = test.set_index(0)
+
+        train = StandardScaler().fit_transform(train.values)
+        test  = StandardScaler().fit_transform(test.values)
+
+        if columns == "all":
+            _, l = train
+            columns = np.arange(l)
+
+        self.batch_size = batch_size
+        self.train = train
+        self.test = test
+        self.seq_length = seq_length
+        self.columns = columns
+        self.task = task
+        self.multi = multi
+
+    def create_sequences_multi(self, data, length, columns, t=1):
+        def rolling_window(a, window):
+            shape = a.shape[:-1] + (a.shape[-1] - window + 1, window)
+            strides = a.strides + (a.strides[-1],)
+            array = np.lib.stride_tricks.as_strided(a, shape=shape, strides=strides)
+            return array
+        data = data[:, columns]
+        arrays = list(map(lambda x: rolling_window(x, length+t), data.T))
+        X = np.stack(arrays, axis=1)
+
+        x = np.expand_dims(X[:,:,:length], axis=-1)
+        y = X[:,:,length:]
+
+        return x, y
+
+    def create_sequences(self, data: np.ndarray, length: int, columns: list, task: int = 0):
+        def rolling_window(a, window, label=None):
+            shape = a.shape[:-1] + (a.shape[-1] - window + 1, window)
+            strides = a.strides + (a.strides[-1],)
+            array = np.lib.stride_tricks.as_strided(
+                a, shape=shape, strides=strides)
+            if label is not None:
+                return np.hstack([array, np.ones((len(array), 1))*int(label)])
+            return array
+        data = data[:, columns]
+        if task > 0:
+            arrays = np.vstack(
+                list(map(lambda v: rolling_window(v, length+task), data.T)))
+            x = np.expand_dims(arrays[:, :-task], axis=-1)
+            y = np.expand_dims(arrays[:, -task:], axis=-1)
+            return x, y
+
+        labels = np.array(columns).astype(str)
+        arrays = np.vstack(
+            list(map(lambda v, c: rolling_window(v, length, c), data.T, labels)))
+        x = np.expand_dims(arrays[:, :-1], axis=-1)
+        y = arrays[:, -1]
+        return x, y
+
+    def setup(self, stage=None):
+        if self.multi:
+            X, y = self.create_sequences_multi(
+                self.train, self.seq_length, self.columns, self.task)
+            self.trainset = SequenceDataset(X, y, forcasting=True)
+            X, y = self.create_sequences_multi(
+                self.test, self.seq_length, self.columns, self.task)
+            self.validset = SequenceDataset(X, y, forcasting=True)
         else:
-            mat[i, j] = (mat[i-1, j]+mat[i+1, j])/2.
-    return mat
+            X, y = self.create_sequences(
+                self.train, self.seq_length, self.columns, self.task)
+            self.trainset = SequenceDataset(X, y, forcasting=self.task>0)
+            X, y = self.create_sequences(
+                self.test, self.seq_length, self.columns, self.task)
+            self.validset = SequenceDataset(X, y, forcasting=self.task>0)
+
+    def train_dataloader(self):
+        return DataLoader(self.trainset, batch_size=self.batch_size, shuffle=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.validset, batch_size=self.batch_size)
 
 
-def read_temps(path):
-    """Lit le fichier de températures"""
-    data = []
-    with open(path, "rt") as fp:
-        reader = csv.reader(fp, delimiter=',')
-        next(reader)
-        for row in reader:
-            data.append([float(x) if x != "" else float('nan')
-                         for x in row[1:]])
-    return torch.tensor(fill_na(np.array(data)), dtype=torch.float)
 
 
 class RNN(nn.Module, ABC):
-    def __init__(self, input_size, latent_size):
+    def __init__(self, input_size: int, latent_size: int):
         super(RNN, self).__init__()
         self.latent_size = latent_size
 
@@ -47,10 +152,10 @@ class RNN(nn.Module, ABC):
         self.tanh = nn.Tanh()
 
     def forward(self, x, h):
-        l = x.shape[0]
+        l = x.shape[1]
         results = []
         for i in range(l):
-            h = self.one_step(x[i], h)
+            h = self.one_step(x[:,i,:], h)
             results.append(h)
         return torch.stack(results)
 
@@ -64,67 +169,49 @@ class RNN(nn.Module, ABC):
         pass
 
     def initHidden(self, n):
-        return torch.zeros(n, self.latent_size).to(device)
+        return torch.zeros(n, self.latent_size, dtype=torch.float32)
 
 
-class SequencesDatasetWithSameLength(torch.utils.data.Dataset):
-    def __init__(self, sequences, labels):
-        super(SequencesDatasetWithSameLength, self).__init__()
-        self.sequences = sequences
-        self.labels = labels
+class LitModel(pl.LightningModule):
+    def __init__(self, backbone:RNN, **kwargs):
+        super().__init__()
+        self.save_hyperparameters(kwargs)
+        self.backbone = backbone
+        if self.hparams.forcasting:
+            self.criterion = nn.MSELoss()
+            self.metric = MeanSquaredError()
+        else:
+            self.criterion = nn.CrossEntropyLoss()
+            self.metric = Accuracy()
 
-    def __len__(self):
-        return len(self.sequences)
+    def forward(self, x):
+        x = self.backbone(x)
+        return x
 
-    def __getitem__(self, idx):
-        return np.expand_dims(np.array(self.sequences[idx]), -1), self.labels[idx]
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        out = self.backbone(x, self.backbone.initHidden(len(x)))
+        logits = self.backbone.decode(out[-1])
+        loss = self.criterion(logits, y)
+        return loss
 
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        out = self.backbone(x, self.backbone.initHidden(len(x)))
+        logits = self.backbone.decode(out[-1])
+        loss = self.criterion(logits, y)
+        self.log('val_loss', loss, prog_bar=True)
 
-class State:
-    def __init__(self, model, optimizer):
-        self.model = model
-        self.optimizer = optimizer
-        self.epoch, self.iteration = 0, 0
+        if self.hparams.forcasting:
+            metric_value = self.metric(logits, y)
+            self.log('val_mse',  metric_value, prog_bar=True)
+        else:
+            preds = torch.argmax(logits, dim=1)
+            metric_value = self.metric(preds, y)
+            self.log('val_acc',  metric_value, prog_bar=True)
+        return loss
 
-
-def save_state(checkpoint_path, state):
-    savepath = Path(f"{checkpoint_path}")
-    with savepath.open("wb") as f:
-        torch.save(state, f)
-
-
-def load_state(checkpoint_path, model, optimizer):
-    savepath = Path(f"{checkpoint_path}")
-    if savepath.is_file():
-        with savepath.open("rb") as f:
-            state = torch.load(f)
-            return state
-    return State(model, optimizer)
-
-
-# class SequencesDataset(torch.utils.data.Dataset):
-#     def __init__(self, X, n_labels, mini=7, maxi=14):
-#         super(SequencesDataset, self).__init__()
-#         self.X = X
-#         self.n_labels = n_labels
-#         self.i = 0
-#         self.mini, self.maxi = mini, maxi
-#         self.length = np.random.randint(mini, maxi)
-
-#     def __len__(self):
-#         return len(self.X)
-
-#     def get_element(self, idx):
-#         col = np.random.randint(self.n_labels)
-#         if (idx + self.length) > len(self.X):
-#             idx -= self.length
-#         r = self.X[idx:idx+self.length, col]
-#         return r, col
-
-#     def __getitem__(self, idx):
-#         self.i += 1
-#         x, y = self.get_element(idx)
-#         return x.reshape(1,-1), y
-
-#     def update(self):
-#         self.length = np.random.randint(self.mini, self.maxi)
+    def configure_optimizers(self):
+        optimizer = optim.Adam(
+            self.parameters(), lr=self.hparams.learning_rate)
+        return optimizer

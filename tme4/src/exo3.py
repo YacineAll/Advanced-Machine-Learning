@@ -4,8 +4,7 @@ import argparse
 import os
 from datetime import datetime
 
-from utils import RNN, device, SequencesDatasetWithSameLength, State, save_state, load_state
-# SequencesDataset
+from utils import RNN
 
 import torch.nn as nn
 import torch
@@ -23,9 +22,9 @@ fixed_length_test = 14
 
 
 class Rnn_forecasting(RNN):
-    def __init__(self, input_size, latent_size, output, pas_de_temp):
+    def __init__(self, input_size, latent_size, pas_de_temp, **kwargs):
         super(Rnn_forecasting, self).__init__(input_size, latent_size)
-        self.out = nn.Linear(latent_size, output)
+        self.out = nn.Linear(latent_size, 1)
         self.decision = nn.Sigmoid()
         self.pas_de_temp = pas_de_temp
 
@@ -33,11 +32,33 @@ class Rnn_forecasting(RNN):
         result = []
         for _ in range(self.pas_de_temp):
             x = self.out(last_h)
-            x = self.decision(x)
+            x = self.decision(x).squeeze(1)
             result.append(x)
 
-        return torch.stack(result)
+        return torch.stack(result, dim=-1).unsqueeze(-1)
 
+class MultipleRNN(RNN):
+    def __init__(self, n_villes, input_size, latent_size, pas_de_temp, **kwargs):
+        super(MultipleRNN, self).__init__(input_size, latent_size)
+        self.m = torch.nn.ModuleList([Rnn_forecasting(
+            input_size=input_size, latent_size=latent_size, pas_de_temp=pas_de_temp) for _ in range(n_villes)])
+
+    def forward(self, X, h=None):
+        result = [list(range(len(self.m)))]
+        l = []
+        for i, model in enumerate(self.m):
+            x = X[:, i, :, :]            
+            out = model(x, model.initHidden(x.shape[0]))
+            l.append(out[-1])
+        result.append(l)
+        return result
+    
+    def decode(self, outs):
+        result = []
+        for i, model in enumerate(self.m):
+            pred = model.decode(outs[i])
+            result.append(pred)
+        return torch.cat(result, dim=-1).permute(0, 2, 1)
 
 ###################################################### Rnn_forecasting MC ######################################################
 
@@ -152,22 +173,6 @@ def one_RNN(X_train, X_test, model, criterion, optimizer, batch_size, pas_de_tem
 
 ###################################################### Multi RNN ######################################################
 
-
-class MultipleRNN(torch.nn.Module):
-    def __init__(self, n_villes, input_size, latent_size, pas_de_temp):
-        super(MultipleRNN, self).__init__()
-        self.m = torch.nn.ModuleList([Rnn_forecasting(
-            input_size=input_size, latent_size=latent_size, output=1, pas_de_temp=pas_de_temp) for _ in range(n_villes)])
-
-    def forward(self, X):
-        l = []
-        for i, model in enumerate(self.m):
-            x = X[:, :, i].unsqueeze(-1)
-            seq_len, batch_size, input_dim = x.shape            
-            out = model(x, model.initHidden(batch_size))
-            pred = model.decode(out[-1]).permute(1, 0, 2)
-            l.append(pred)
-        return torch.cat(l, dim=-1)
 
 
 def trainMR(model, criterion, optimizer, dataloader, test_loader, n_epochs, log_dir, checkpoint_path):

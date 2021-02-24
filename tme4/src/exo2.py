@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 
 
-from utils import RNN, device, SequencesDatasetWithSameLength, State, save_state, load_state
+from utils import RNN
 from torch.utils.tensorboard import SummaryWriter
 
 import torch
@@ -19,10 +19,10 @@ from sklearn.metrics import accuracy_score
 
 
 class Rnn_classifier(RNN):
-    def __init__(self, input_size, latent_size, output):
+    def __init__(self, input_size, latent_size, output, **kwargs):
         super(Rnn_classifier, self).__init__(input_size, latent_size)
         self.out = nn.Linear(latent_size, output)
-        self.decision = nn.Sigmoid() if output == 2 else nn.Softmax(dim=1)
+        self.decision = nn.Softmax(dim=1)
 
     def decode(self, h):
         x = self.out(h)
