@@ -1,0 +1,3 @@
+tensorboard dev upload --logdir log_dir \
+    --name "(optional) My latest experiment" \
+    --description "(optional) Simple comparison of several hyperparameters" 
